@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
   import i18n from '$lib/i18n.json';
   import 'leaflet/dist/leaflet.css';
 
@@ -22,6 +22,12 @@
   let lineLayer: import('leaflet').LayerGroup | null = null;
   let locating = false;
   let reverseAbort: AbortController | null = null;
+  let midpointInfo = '';
+  let midpointStatus: 'idle' | 'loading' | 'error' = 'idle';
+  let lastMidKey = '';
+
+  let history: Point[][] = [[]];
+  let historyIndex = 0;
 
   const parseCoord = (value: string) => {
     const n = Number(value);
@@ -31,14 +37,6 @@
   const isValidLat = (lat: number) => lat >= -90 && lat <= 90;
   const isValidLon = (lon: number) => lon >= -180 && lon <= 180;
 
-  const escapeHtml = (value: string) =>
-    value
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#39;');
-
   const reverseGeocode = async () => {
     if (!mid || !midLayer) return;
     const { lat, lon } = mid;
@@ -47,9 +45,9 @@
     const controller = new AbortController();
     reverseAbort = controller;
 
-    if (!midLayer.getPopup()) midLayer.bindPopup('');
-    midLayer.setPopupContent(`<div class="popup-body">${t('midpointLookupLoading')}</div>`);
-    midLayer.openPopup();
+    midpointStatus = 'loading';
+    midpointInfo = '';
+    midLayer.setPopupContent(t('midpointLookupLoading'));
 
     try {
       const url = new URL('https://nominatim.openstreetmap.org/reverse');
@@ -66,19 +64,17 @@
       if (!res.ok) throw new Error('reverse_geocode_failed');
 
       const data = (await res.json()) as { display_name?: string };
-      const display = data?.display_name ? escapeHtml(data.display_name) : t('midpointLookupUnknown');
-      const content = `
-        <div class="popup">
-          <div class="popup-title">${t('midpointLookupTitle')}</div>
-          <div class="popup-body">${display}</div>
-          <div class="popup-attrib">${t('midpointLookupAttribution')}</div>
-        </div>`;
-      midLayer.setPopupContent(content);
+      const display = data?.display_name ? data.display_name : t('midpointLookupUnknown');
+      midpointInfo = display;
+      midpointStatus = 'idle';
+      midLayer.setPopupContent(
+        `${t('midpointLookupTitle')}: ${display}\n${t('midpointLookupAttribution')}`
+      );
     } catch (err) {
       if (controller.signal.aborted) return;
-      midLayer.setPopupContent(
-        `<div class="popup-body">${t('midpointLookupError')}</div>`
-      );
+      midpointStatus = 'error';
+      midpointInfo = '';
+      midLayer.setPopupContent(t('midpointLookupError'));
     }
   };
 
@@ -133,35 +129,70 @@
 
       if (!midLayer) {
         midLayer = L.circleMarker([mid.lat, mid.lon], {
-          radius: 8,
+          radius: 12,
           weight: 2,
           color: '#b91c1c',
           fillColor: '#f87171',
           fillOpacity: 0.95
         }).addTo(map);
+        midLayer.bringToFront();
+        midLayer.bindPopup('');
         midLayer.on('click', (event: import('leaflet').LeafletMouseEvent) => {
           L?.DomEvent.stopPropagation(event);
-          reverseGeocode();
+          midLayer?.openPopup();
         });
       } else {
         midLayer.setLatLng([mid.lat, mid.lon]);
+        midLayer.bringToFront();
+      }
+
+      const midKey = `${mid.lat.toFixed(6)},${mid.lon.toFixed(6)}`;
+      if (midKey !== lastMidKey) {
+        lastMidKey = midKey;
+        reverseGeocode();
       }
 
     } else if (midLayer) {
       map.removeLayer(midLayer);
       midLayer = null;
       reverseAbort?.abort();
+      midpointInfo = '';
+      midpointStatus = 'idle';
+      lastMidKey = '';
     }
   };
 
-  const addPoint = (lat: number, lon: number) => {
-    points = [...points, { lat, lon }];
+  const recordHistory = (next: Point[]) => {
+    history = history.slice(0, historyIndex + 1);
+    history.push(next);
+    historyIndex = history.length - 1;
+  };
+
+  const setPoints = (next: Point[], record = true) => {
+    points = next;
+    if (record) recordHistory(next);
     refreshMarkers();
   };
 
+  const addPoint = (lat: number, lon: number) => {
+    setPoints([...points, { lat, lon }]);
+  };
+
   const removePoint = (index: number) => {
-    points = points.filter((_, i) => i !== index);
-    refreshMarkers();
+    if (index < 0 || index >= points.length) return;
+    setPoints(points.filter((_, i) => i !== index));
+  };
+
+  const undo = () => {
+    if (historyIndex <= 0) return;
+    historyIndex -= 1;
+    setPoints(history[historyIndex], false);
+  };
+
+  const redo = () => {
+    if (historyIndex >= history.length - 1) return;
+    historyIndex += 1;
+    setPoints(history[historyIndex], false);
   };
 
   const addFromInput = () => {
@@ -185,9 +216,8 @@
   };
 
   const clearPoints = () => {
-    points = [];
     error = '';
-    refreshMarkers();
+    setPoints([]);
   };
 
   const locateMe = () => {
@@ -230,6 +260,33 @@
     refreshMarkers();
 
     locateMe();
+  });
+
+  const onKeydown = (event: KeyboardEvent) => {
+    const isUndo = (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'z';
+    if (!isUndo) return;
+
+    const target = event.target;
+    if (
+      target instanceof HTMLInputElement ||
+      target instanceof HTMLTextAreaElement ||
+      (target instanceof HTMLElement && target.isContentEditable)
+    ) {
+      return;
+    }
+
+    event.preventDefault();
+    if (event.shiftKey) {
+      redo();
+    } else {
+      undo();
+    }
+  };
+
+  onMount(() => {
+    if (typeof window === 'undefined') return;
+    window.addEventListener('keydown', onKeydown);
+    return () => window.removeEventListener('keydown', onKeydown);
   });
 </script>
 
@@ -293,8 +350,22 @@
         <span>{t('points')}</span>
       </div>
       <div>
-        <strong>{mid ? `${mid.lat.toFixed(6)}, ${mid.lon.toFixed(6)}` : '—'}</strong>
-        <span>{t('midpoint')}</span>
+        <strong>{t('midpoint')}</strong>
+        <span>{mid ? `${mid.lat.toFixed(6)}, ${mid.lon.toFixed(6)}` : '—'}</span>
+        {#if mid}
+          <div class="midpoint-meta">
+            {#if midpointStatus === 'loading'}
+              <span>{t('midpointLookupLoading')}</span>
+            {:else if midpointStatus === 'error'}
+              <span>{t('midpointLookupError')}</span>
+            {:else if midpointInfo}
+              <span>{midpointInfo}</span>
+              <span class="midpoint-attrib">{t('midpointLookupAttribution')}</span>
+            {:else}
+              <span>{t('midpointLookupPrompt')}</span>
+            {/if}
+          </div>
+        {/if}
       </div>
     </div>
 
@@ -430,6 +501,20 @@
     white-space: pre-wrap;
   }
 
+  .midpoint-meta {
+    margin-top: 6px;
+    display: grid;
+    gap: 4px;
+    font-size: 0.8rem;
+    color: #cbd5f5;
+    line-height: 1.35;
+  }
+
+  .midpoint-attrib {
+    font-size: 0.7rem;
+    color: #94a3b8;
+  }
+
   :global(.leaflet-popup-content-wrapper) {
     background: rgba(12, 17, 32, 0.95);
     color: #e2e8f0;
@@ -442,22 +527,9 @@
 
   :global(.leaflet-popup-content) {
     margin: 10px 12px;
-  }
-
-  .popup-title {
-    font-weight: 600;
-    margin-bottom: 6px;
-  }
-
-  .popup-body {
     font-size: 0.85rem;
     line-height: 1.35;
-  }
-
-  .popup-attrib {
-    margin-top: 6px;
-    font-size: 0.7rem;
-    color: #94a3b8;
+    white-space: pre-line;
   }
 
   .inputs {
@@ -535,6 +607,7 @@
     color: #fca5a5;
     font-size: 0.85rem;
   }
+
 
   .stats {
     display: grid;
